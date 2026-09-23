@@ -11,7 +11,14 @@ from __future__ import annotations
 import pytest
 
 from tradingagents.agents.utils.memory import TradingMemoryLog
-from tradingagents.backtest import iter_grid, run_backtest, summarize
+from tradingagents.backtest import (
+    BacktestResult,
+    iter_grid,
+    run_backtest,
+    run_repeated_backtest,
+    summarize,
+    summarize_stability,
+)
 
 DECISION = "Rating: Buy\n\nbuy it"
 
@@ -246,3 +253,106 @@ def test_the_window_reported_is_the_one_the_outcomes_used(tmp_path):
     log.update_with_outcome("NVDA", "2026-01-05", 0.1, 0.04, 21, "note", "2026-02-01")
 
     assert "21 trading days" in summarize(log).render()
+
+
+# --- baselines: the same cells, scored against a fixed rating -----------------
+
+
+@pytest.mark.unit
+def test_baseline_scores_the_same_cells_with_a_fixed_direction(tmp_path):
+    """Alpha does not depend on what the system said, so a constant-direction
+    baseline can be read off the same resolved cells at no extra cost."""
+    log = _log_with(tmp_path, [
+        ("NVDA", "2026-01-05", "**Rating**: Buy\n\nx", (0.10, 0.04)),
+        ("AAPL", "2026-01-05", "**Rating**: Sell\n\nx", (-0.02, -0.02)),
+    ])
+    baseline = summarize(log).baseline
+
+    assert baseline["Always Buy"].count == 2 and baseline["Always Sell"].count == 2
+    assert baseline["Always Buy"].hit_rate == 0.5
+    assert baseline["Always Sell"].hit_rate == 0.5
+    assert round(baseline["Always Buy"].mean_alpha, 4) == round(baseline["Always Sell"].mean_alpha, 4) == 0.01
+
+
+@pytest.mark.unit
+def test_baseline_is_absent_when_nothing_is_resolved(tmp_path):
+    log = _log_with(tmp_path, [("NVDA", "2026-01-05", DECISION, None)])
+    assert summarize(log).baseline == {}
+
+
+@pytest.mark.unit
+def test_baseline_appears_in_the_rendered_report(tmp_path):
+    text = summarize(_log_with(tmp_path, [("NVDA", "2026-01-05", DECISION, (0.1, 0.05))])).render()
+    assert "Always Buy" in text and "Always Sell" in text
+
+
+# --- repeated sampling: is a rating stable across passes, or just lucky -------
+
+
+@pytest.mark.unit
+def test_repeated_backtest_runs_k_independent_passes(tmp_path):
+    results = run_repeated_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path), k=3)
+
+    assert len(results) == 3
+    assert len({r.run_id for r in results}) == 3
+    assert len({r.log_path for r in results}) == 3
+    assert all(r.cells_run == 1 for r in results)
+
+
+@pytest.mark.unit
+def test_repeated_backtest_rejects_k_below_one(tmp_path):
+    with pytest.raises(ValueError, match="at least 1"):
+        run_repeated_backtest(["NVDA"], ["2026-01-05"], _config(tmp_path), k=0)
+
+
+def _result_with(tmp_path, name, rows):
+    log_path = tmp_path / f"{name}.md"
+    log = TradingMemoryLog({"memory_log_path": str(log_path)})
+    for ticker, date, decision, outcome in rows:
+        log.store_decision(ticker, date, decision)
+        if outcome is not None:
+            log.update_with_outcome(ticker, date, outcome[0], outcome[1], 5, "note", "2026-02-01")
+    return BacktestResult(run_id=name, log_path=log_path)
+
+
+@pytest.mark.unit
+def test_stability_is_full_when_every_repeat_agrees(tmp_path):
+    rows = [("NVDA", "2026-01-05", "**Rating**: Buy\n\nx", (0.1, 0.04))]
+    results = [_result_with(tmp_path, f"r{i}", rows) for i in range(3)]
+
+    score = summarize_stability(results)
+
+    assert score.cells == 1
+    assert score.mean_agreement == 1.0
+    assert score.unanimous_rate == 1.0
+
+
+@pytest.mark.unit
+def test_stability_reflects_disagreement_across_repeats(tmp_path):
+    results = [
+        _result_with(tmp_path, "r0", [("NVDA", "2026-01-05", "**Rating**: Buy\n\nx", (0.1, 0.04))]),
+        _result_with(tmp_path, "r1", [("NVDA", "2026-01-05", "**Rating**: Sell\n\nx", (0.1, 0.04))]),
+        _result_with(tmp_path, "r2", [("NVDA", "2026-01-05", "**Rating**: Buy\n\nx", (0.1, 0.04))]),
+    ]
+
+    score = summarize_stability(results)
+
+    assert score.cells == 1
+    assert round(score.mean_agreement, 4) == round(2 / 3, 4)
+    assert score.unanimous_rate == 0.0
+
+
+@pytest.mark.unit
+def test_stability_ignores_a_cell_not_resolved_in_every_pass(tmp_path):
+    results = [
+        _result_with(tmp_path, "r0", [("NVDA", "2026-01-05", "**Rating**: Buy\n\nx", (0.1, 0.04))]),
+        _result_with(tmp_path, "r1", [("NVDA", "2026-01-05", "**Rating**: Buy\n\nx", None)]),
+    ]
+
+    assert summarize_stability(results).cells == 0
+
+
+@pytest.mark.unit
+def test_stability_render_names_what_it_cannot_compare(tmp_path):
+    results = [_result_with(tmp_path, "r0", [("NVDA", "2026-01-05", DECISION, None)])]
+    assert "nothing to compare" in summarize_stability(results).render().lower()

@@ -43,7 +43,13 @@ from cli.utils import (
     select_shallow_thinking_agent,
 )
 from tradingagents.agents.utils.rating import is_review
-from tradingagents.backtest import iter_grid, run_backtest, summarize
+from tradingagents.backtest import (
+    iter_grid,
+    run_backtest,
+    run_repeated_backtest,
+    summarize,
+    summarize_stability,
+)
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.analyst_execution import (
@@ -1423,6 +1429,12 @@ def backtest(
     run_id: str = typer.Option(
         None, "--run-id", help="Continue an earlier sweep: its cells are skipped and its log reused"
     ),
+    k_samples: int = typer.Option(
+        1, "--k-samples",
+        help="Repeat the whole grid this many times, into separate logs, and report how much "
+        "the rating for the same cell moves between repeats — one pass cannot tell a skilled "
+        "call from a lucky sample.",
+    ),
 ):
     """Score past decisions over a grid of tickers and dates."""
     from tradingagents.agents.utils.memory import TradingMemoryLog
@@ -1438,22 +1450,40 @@ def backtest(
     if not names:
         console.print("[red]No ticker to analyze; pass them comma-separated, e.g. NVDA,AAPL[/red]")
         raise typer.Exit(code=1)
+    if k_samples < 1:
+        console.print("[red]--k-samples must be at least 1[/red]")
+        raise typer.Exit(code=1)
 
     kwargs = {"asset_type": asset_type, "portfolio": book, "run_id": run_id}
     if analysts:
         kwargs["selected_analysts"] = [a.strip().lower() for a in analysts.split(",") if a.strip()]
 
     try:
-        result = run_backtest(names, dates, DEFAULT_CONFIG, **kwargs)
+        if k_samples > 1:
+            results = run_repeated_backtest(names, dates, DEFAULT_CONFIG, k_samples, **kwargs)
+        else:
+            results = [run_backtest(names, dates, DEFAULT_CONFIG, **kwargs)]
     except Exception as exc:  # a missing key or an unknown analyst is a setup error
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from None
-    console.print(summarize(TradingMemoryLog({"memory_log_path": str(result.log_path)})).render())
-    console.print(f"\nRan {result.cells_run} cells, skipped {result.skipped}. Log: {result.log_path}")
-    for ticker, date, reason in result.failures:
-        console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {reason}")
-    for ticker, reason in result.settlement_failures:
-        console.print(f"[yellow]unsettled:[/yellow] {ticker}: {reason}")
+
+    console.print(summarize(TradingMemoryLog({"memory_log_path": str(results[0].log_path)})).render())
+    if len(results) > 1:
+        console.print("")
+        console.print(summarize_stability(results).render())
+
+    total_cells = sum(r.cells_run for r in results)
+    total_skipped = sum(r.skipped for r in results)
+    if len(results) > 1:
+        console.print(f"\nRan {total_cells} cells, skipped {total_skipped}, "
+                       f"across {len(results)} repeats under {results[0].log_path.parent.parent}")
+    else:
+        console.print(f"\nRan {total_cells} cells, skipped {total_skipped}. Log: {results[0].log_path}")
+    for result in results:
+        for ticker, date, reason in result.failures:
+            console.print(f"[yellow]failed:[/yellow] {ticker} {date}: {reason}")
+        for ticker, reason in result.settlement_failures:
+            console.print(f"[yellow]unsettled:[/yellow] {ticker}: {reason}")
 
 
 if __name__ == "__main__":

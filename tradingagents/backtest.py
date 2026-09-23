@@ -17,6 +17,7 @@ cell rather than a position carried forward.
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -95,6 +96,29 @@ class RatingScore:
     mean_alpha: float
 
 
+_BASELINE_DIRECTIONS = {"Always Buy": 1, "Always Sell": -1}
+
+
+def _baseline_scores(resolved: list[tuple[dict, float]]) -> dict[str, RatingScore]:
+    """What a fixed, contentless rating would have scored on these same cells.
+
+    Not a second backtest: alpha is a market fact, not a function of what the
+    system said, so replaying it against a constant direction costs nothing
+    and gives the by-rating scores something to beat besides zero.
+    """
+    alphas = [a for _, a in resolved]
+    if not alphas:
+        return {}
+    return {
+        name: RatingScore(
+            count=len(alphas),
+            hit_rate=sum(a * direction > 0 for a in alphas) / len(alphas),
+            mean_alpha=sum(alphas) / len(alphas),
+        )
+        for name, direction in _BASELINE_DIRECTIONS.items()
+    }
+
+
 @dataclass
 class BacktestSummary:
     resolved: int
@@ -102,6 +126,7 @@ class BacktestSummary:
     by_rating: dict[str, RatingScore]
     unscored: int = 0
     holding: str = ""
+    baseline: dict[str, RatingScore] = field(default_factory=dict)
 
     def render(self) -> str:
         lines = [f"Resolved cells: {self.resolved} · pending: {self.pending}"
@@ -113,6 +138,14 @@ class BacktestSummary:
                 f"- {rating}: n={score.count}, {called}, "
                 f"mean alpha {score.mean_alpha:+.2%} vs the benchmark"
             )
+        if self.baseline:
+            lines.append("")
+            lines.append("Baselines on the same cells (a fixed rating, not a second run):")
+            for name, score in self.baseline.items():
+                lines.append(
+                    f"- {name}: called the direction {score.hit_rate:.0%}, "
+                    f"mean alpha {score.mean_alpha:+.2%} vs the benchmark"
+                )
         lines.append("")
         if self.pending:
             lines.append("Pending cells are not scored above; re-run to settle them.")
@@ -174,6 +207,81 @@ def run_backtest(
     return result
 
 
+def run_repeated_backtest(
+    tickers: list[str],
+    dates: list[str],
+    config: dict,
+    k: int,
+    asset_type: str = "stock",
+    portfolio=None,
+    selected_analysts=("market", "social", "news", "fundamentals"),
+    run_id: str | None = None,
+) -> list[BacktestResult]:
+    """Run the same grid ``k`` times, each into its own log.
+
+    One pass yields one rating per cell, so it cannot tell a skilled call from
+    a lucky temperature sample. Repeating the identical grid and comparing
+    ratings across passes is the only way to separate the two. Each pass gets
+    its own run_id (and so its own log and skip-set), the same isolation
+    run_backtest already gives a single sweep — a failed or interrupted pass
+    does not touch the others and can be resumed on its own.
+    """
+    if k < 1:
+        raise ValueError("k must be at least 1")
+    base_id = safe_ticker_component(run_id or datetime.now().strftime("%Y%m%d_%H%M%S"))
+    return [
+        run_backtest(tickers, dates, config, asset_type, portfolio, selected_analysts,
+                     run_id=f"{base_id}_k{i}")
+        for i in range(k)
+    ]
+
+
+@dataclass
+class StabilityScore:
+    cells: int
+    mean_agreement: float
+    unanimous_rate: float
+
+    def render(self) -> str:
+        if not self.cells:
+            return "No cell resolved in every repeat; nothing to compare for stability."
+        return (
+            f"Rating stability across repeats (n={self.cells} cells resolved in every pass): "
+            f"{self.mean_agreement:.0%} average agreement, "
+            f"unanimous in {self.unanimous_rate:.0%} of cells."
+        )
+
+
+def summarize_stability(results: list[BacktestResult]) -> StabilityScore:
+    """How much the rating for the same cell moves across repeated samples.
+
+    Alpha is a market fact fixed by ticker/date/holding-window, identical
+    across repeats of the same cell; only the rating can vary between passes.
+    A cell counts here only if every pass resolved it, so a pass-specific
+    failure cannot bias the agreement rate up or down.
+    """
+    per_cell: dict[tuple[str, str], list[str]] = {}
+    for result in results:
+        log = TradingMemoryLog({"memory_log_path": str(result.log_path)})
+        for e in log.load_entries():
+            if e["pending"] or e["rating"] == RATING_REVIEW:
+                continue
+            per_cell.setdefault((e["ticker"], e["date"]), []).append(e["rating"])
+
+    k = len(results)
+    complete = [ratings for ratings in per_cell.values() if len(ratings) == k]
+    if not complete:
+        return StabilityScore(cells=0, mean_agreement=0.0, unanimous_rate=0.0)
+
+    agreements = [Counter(ratings).most_common(1)[0][1] / k for ratings in complete]
+    unanimous = sum(1 for a in agreements if a == 1.0)
+    return StabilityScore(
+        cells=len(complete),
+        mean_agreement=sum(agreements) / len(agreements),
+        unanimous_rate=unanimous / len(complete),
+    )
+
+
 def summarize(memory_log: TradingMemoryLog) -> BacktestSummary:
     """Score the settled decisions in a log, by rating."""
     entries = memory_log.load_entries()
@@ -198,4 +306,5 @@ def summarize(memory_log: TradingMemoryLog) -> BacktestSummary:
     return BacktestSummary(resolved=len(resolved),
                            pending=len(entries) - len(resolved) - unscored,
                            by_rating=by_rating, unscored=unscored,
-                           holding=", ".join(sorted(windows)) or "the configured window")
+                           holding=", ".join(sorted(windows)) or "the configured window",
+                           baseline=_baseline_scores(resolved))
